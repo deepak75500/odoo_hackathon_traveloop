@@ -1,4 +1,5 @@
-const API_BASE = "/api";
+export const API_ORIGIN = (import.meta.env.VITE_API_URL || "").replace(/\/$/, "");
+const API_BASE = `${API_ORIGIN}/api`;
 
 let token = "";
 
@@ -25,6 +26,12 @@ export function saveSession(nextToken, user) {
   } catch (_) {}
 }
 
+export function assetUrl(url) {
+  if (!url) return "";
+  if (/^(https?:|data:|blob:)/i.test(url)) return url;
+  return url.startsWith("/") ? `${API_ORIGIN}${url}` : url;
+}
+
 async function request(path, options = {}) {
   const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
   if (token) headers.Authorization = `Bearer ${token}`;
@@ -43,6 +50,21 @@ export const api = {
   signup: (body) => request("/auth/signup", { method: "POST", body }),
   me: () => request("/me"),
   updateMe: (body) => request("/me", { method: "PUT", body }),
+  uploadPhoto: async (file, oldUrl = "") => {
+    const form = new FormData();
+    form.append("file", file);
+    form.append("old_url", oldUrl || "");
+    const headers = {};
+    if (token) headers.Authorization = `Bearer ${token}`;
+    const response = await fetch(`${API_BASE}/upload/photo`, {
+      method: "POST",
+      headers,
+      body: form,
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.detail || payload.error || "Upload failed");
+    return payload;
+  },
   deleteMe: () => request("/me", { method: "DELETE" }),
   dashboard: () => request("/dashboard"),
   trips: () => request("/trips"),
@@ -69,6 +91,13 @@ export const api = {
   share: (tripId) => request(`/trips/${tripId}/share`, { method: "POST" }),
   publicTrip: (token) => request(`/public/${token}`),
   community: () => request("/community"),
+  createCommunityPost: (body) => request("/community", { method: "POST", body }),
+  updateCommunityPost: (postId, body) => request(`/community/${postId}`, { method: "PUT", body }),
+  deleteCommunityPost: (postId) => request(`/community/${postId}`, { method: "DELETE" }),
+  toggleCommunityLike: (postId) => request(`/community/${postId}/like`, { method: "POST" }),
+  createCommunityComment: (postId, body) => request(`/community/${postId}/comments`, { method: "POST", body }),
+  updateCommunityComment: (commentId, body) => request(`/community/comments/${commentId}`, { method: "PUT", body }),
+  deleteCommunityComment: (commentId) => request(`/community/comments/${commentId}`, { method: "DELETE" }),
   saved: () => request("/saved"),
   saveCity: (cityId) => request("/saved", { method: "POST", body: { city_id: cityId } }),
   unsaveCity: (cityId) => request(`/saved/${cityId}`, { method: "DELETE" }),
