@@ -9,6 +9,17 @@ const formatDate = (d) =>
 
 const FALLBACK = "https://images.unsplash.com/photo-1476514525535-07fb3b4ae5f1?w=600&q=70";
 const API_BASE = "http://localhost:8082";
+const assetUrl = (url) => (url?.startsWith("/uploads") ? `${API_BASE}${url}` : url);
+
+function tripStatus(trip) {
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const start = trip.start_date ? new Date(`${trip.start_date}T00:00:00`) : today;
+  const end = trip.end_date ? new Date(`${trip.end_date}T00:00:00`) : start;
+  if (start > today) return "upcoming";
+  if (end < today) return "completed";
+  return "ongoing";
+}
 
 /* ─── CreateTripScreen ─── */
 const initialTrip = {
@@ -110,7 +121,7 @@ export function CreateTripScreen({ onCreate, cities: propCities = [], activities
         </div>
         <button style={cs.avatar} onClick={() => setScreen?.("profile")} title={user?.name}>
           {user?.photo_url
-            ? <img src={user.photo_url} alt="avatar" style={cs.avatarImg} />
+            ? <img src={assetUrl(user.photo_url)} alt="avatar" style={cs.avatarImg} />
             : initials}
         </button>
       </nav>
@@ -301,8 +312,163 @@ export function CreateTripScreen({ onCreate, cities: propCities = [], activities
 
 /* ─── TripListScreen ─── */
 export function TripListScreen({ trips, selectTrip, removeTrip, setScreen, user }) {
+  const [search, setSearch] = useState("");
+  const [statusFilter, setStatusFilter] = useState("all");
+  const [sortDir, setSortDir] = useState("asc");
   const initials = (user?.name ?? "T")
     .split(" ").map((w) => w[0]).join("").slice(0, 2).toUpperCase();
+  const query = search.trim().toLowerCase();
+  const visibleTrips = (trips || [])
+    .filter((trip) => {
+      const status = tripStatus(trip);
+      const matchesStatus = statusFilter === "all" || status === statusFilter;
+      const matchesSearch =
+        !query ||
+        trip.name?.toLowerCase().includes(query) ||
+        trip.description?.toLowerCase().includes(query);
+      return matchesStatus && matchesSearch;
+    })
+    .sort((a, b) => {
+      const order = (a.start_date || "").localeCompare(b.start_date || "");
+      return sortDir === "asc" ? order : -order;
+    });
+  const sections = [
+    ["ongoing", "Ongoing"],
+    ["upcoming", "Up-coming"],
+    ["completed", "Completed"],
+  ].map(([status, label]) => ({
+    status,
+    label,
+    trips: visibleTrips.filter((trip) => tripStatus(trip) === status),
+  }));
+
+  function TripOverviewCard({ trip }) {
+    return (
+      <article style={cs.tripSummaryCard}>
+        <div style={cs.tripSummaryMedia}>
+          <img
+            src={trip.cover_photo || FALLBACK}
+            alt={trip.name}
+            style={cs.tripSummaryImg}
+            onError={(e) => (e.target.src = FALLBACK)}
+          />
+        </div>
+        <div style={cs.tripSummaryBody}>
+          <strong style={cs.tripSummaryTitle}>{trip.name}</strong>
+          <span style={cs.tripSummaryDates}>
+            {formatDate(trip.start_date)} - {formatDate(trip.end_date)}
+          </span>
+          <p style={cs.tripSummaryText}>
+            {trip.description || "Short overview of the trip"}
+          </p>
+          <div style={cs.tripSummaryMeta}>
+            <span>{trip.destination_count ?? 0} stop{trip.destination_count === 1 ? "" : "s"}</span>
+            <span>{money(trip.budget_limit)}</span>
+          </div>
+        </div>
+        <div style={cs.tripSummaryActions}>
+          <button style={cs.actionBtn} onClick={() => selectTrip?.(trip.id, "itinerary")}>
+            View
+          </button>
+          <button style={cs.actionBtn} onClick={() => selectTrip?.(trip.id, "builder")}>
+            Edit
+          </button>
+          <button
+            style={{ ...cs.actionBtn, ...cs.dangerBtn }}
+            onClick={() => removeTrip?.(trip.id)}
+          >
+            Delete
+          </button>
+        </div>
+      </article>
+    );
+  }
+
+  return (
+    <div style={cs.root}>
+      <nav style={cs.navbar}>
+        <div style={cs.navBrand}>
+          <span style={cs.navLogo}>Traveloop</span>
+        </div>
+        <button style={cs.avatar} onClick={() => setScreen?.("profile")}>
+          {user?.photo_url
+            ? <img src={assetUrl(user.photo_url)} alt="avatar" style={cs.avatarImg} />
+            : initials}
+        </button>
+      </nav>
+
+      <div style={cs.body}>
+        <div style={cs.tripListToolbar}>
+          <input
+            style={cs.tripSearch}
+            placeholder="Search bar..."
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+          />
+          <button style={cs.miniToolBtn} onClick={() => setStatusFilter("all")}>
+            Group by
+          </button>
+          <select
+            style={cs.miniToolSelect}
+            value={statusFilter}
+            onChange={(e) => setStatusFilter(e.target.value)}
+          >
+            <option value="all">Filter</option>
+            <option value="ongoing">Ongoing</option>
+            <option value="upcoming">Up-coming</option>
+            <option value="completed">Completed</option>
+          </select>
+          <button
+            style={cs.miniToolBtn}
+            onClick={() => setSortDir((cur) => (cur === "asc" ? "desc" : "asc"))}
+          >
+            Sort {sortDir === "asc" ? "old" : "new"}
+          </button>
+        </div>
+
+        <div style={cs.listHeader}>
+          <div>
+            <p style={cs.listEyebrow}>Screen 6</p>
+            <h2 style={cs.listTitle}>User Trip Listing</h2>
+          </div>
+          <button style={cs.submitBtn} onClick={() => setScreen?.("create")}>
+            + New Trip
+          </button>
+        </div>
+
+        {visibleTrips.length ? (
+          <div style={cs.tripSectionStack}>
+            {sections.map((section) => (
+              <section style={cs.tripListSection} key={section.status}>
+                <h3 style={cs.tripSectionTitle}>{section.label}</h3>
+                {section.trips.length ? (
+                  <div style={cs.tripSummaryList}>
+                    {section.trips.map((trip) => (
+                      <TripOverviewCard key={trip.id} trip={trip} />
+                    ))}
+                  </div>
+                ) : (
+                  <div style={cs.tripEmptyRow}>No {section.label.toLowerCase()} trips.</div>
+                )}
+              </section>
+            ))}
+          </div>
+        ) : (
+          <div style={cs.emptyState}>
+            <h3 style={{ margin: "0 0 6px", color: "#1a1a2e", fontSize: 18, fontWeight: 800 }}>
+              No matching trips
+            </h3>
+            <p style={{ color: "#888", marginBottom: 20, fontSize: 14 }}>
+              Create a new itinerary or adjust your filters.
+            </p>
+            <button style={cs.submitBtn} onClick={() => setScreen?.("create")}>
+              + Create Trip
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
 
   return (
     <div style={cs.root}>
@@ -314,7 +480,7 @@ export function TripListScreen({ trips, selectTrip, removeTrip, setScreen, user 
         </div>
         <button style={cs.avatar} onClick={() => setScreen?.("profile")}>
           {user?.photo_url
-            ? <img src={user.photo_url} alt="avatar" style={cs.avatarImg} />
+            ? <img src={assetUrl(user.photo_url)} alt="avatar" style={cs.avatarImg} />
             : initials}
         </button>
       </nav>
@@ -658,6 +824,90 @@ const cs = {
   },
   listEyebrow: { margin: "0 0 2px", fontSize: 12, fontWeight: 700, color: "#888", textTransform: "uppercase", letterSpacing: 0.8 },
   listTitle: { margin: 0, fontSize: 24, fontWeight: 800, color: "#1a1a2e" },
+  tripListToolbar: {
+    display: "flex",
+    gap: 8,
+    alignItems: "center",
+    background: "#fff",
+    border: "1px solid #ececec",
+    borderRadius: 12,
+    padding: 10,
+    marginBottom: 16,
+    boxShadow: "0 2px 10px rgba(0,0,0,0.05)",
+    flexWrap: "wrap",
+  },
+  tripSearch: {
+    flex: 1,
+    minWidth: 220,
+    border: "1.5px solid #e0e0e8",
+    borderRadius: 8,
+    padding: "9px 12px",
+    fontSize: 13,
+    outline: "none",
+    background: "#fafafa",
+  },
+  miniToolBtn: {
+    border: "1.5px solid #e0e0e8",
+    borderRadius: 8,
+    background: "#fff",
+    padding: "9px 12px",
+    fontSize: 12,
+    fontWeight: 800,
+    color: "#1a1a2e",
+    cursor: "pointer",
+  },
+  miniToolSelect: {
+    border: "1.5px solid #e0e0e8",
+    borderRadius: 8,
+    background: "#fff",
+    padding: "9px 12px",
+    fontSize: 12,
+    fontWeight: 800,
+    color: "#1a1a2e",
+    cursor: "pointer",
+  },
+  tripSectionStack: { display: "flex", flexDirection: "column", gap: 18 },
+  tripListSection: {
+    background: "#fff",
+    border: "1px solid #ececec",
+    borderRadius: 14,
+    padding: 14,
+    boxShadow: "0 2px 10px rgba(0,0,0,0.06)",
+  },
+  tripSectionTitle: {
+    margin: "0 0 10px",
+    color: "#1a1a2e",
+    fontSize: 15,
+    fontWeight: 900,
+  },
+  tripSummaryList: { display: "flex", flexDirection: "column", gap: 10 },
+  tripSummaryCard: {
+    display: "grid",
+    gridTemplateColumns: "110px 1fr 150px",
+    gap: 14,
+    alignItems: "stretch",
+    border: "1.5px solid #e0e0e8",
+    borderRadius: 10,
+    padding: 10,
+    background: "#fbfbfd",
+  },
+  tripSummaryMedia: { borderRadius: 8, overflow: "hidden", minHeight: 88, background: "#eee" },
+  tripSummaryImg: { width: "100%", height: "100%", objectFit: "cover", display: "block" },
+  tripSummaryBody: { minWidth: 0, display: "flex", flexDirection: "column", gap: 4, justifyContent: "center" },
+  tripSummaryTitle: { color: "#1a1a2e", fontSize: 16, fontWeight: 900 },
+  tripSummaryDates: { color: "#777", fontSize: 12 },
+  tripSummaryText: { margin: "3px 0", color: "#555", fontSize: 13, lineHeight: 1.45 },
+  tripSummaryMeta: { display: "flex", gap: 8, color: "#5c6bc0", fontSize: 12, fontWeight: 800 },
+  tripSummaryActions: { display: "grid", gridTemplateColumns: "1fr", gap: 8, alignContent: "center" },
+  tripEmptyRow: {
+    border: "1.5px dashed #e0e0e8",
+    borderRadius: 10,
+    color: "#999",
+    fontSize: 13,
+    padding: 18,
+    textAlign: "center",
+    background: "#fafafa",
+  },
   tripGrid: {
     display: "grid",
     gridTemplateColumns: "repeat(auto-fill, minmax(260px, 1fr))",

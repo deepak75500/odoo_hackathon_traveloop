@@ -1,4 +1,5 @@
 import { useEffect, useState, useMemo } from "react";
+import { api, assetUrl } from "../api.js";
 
 /* ─── constants ─── */
 const API_BASE = "http://localhost:8082";
@@ -177,7 +178,7 @@ export function CitySearchScreen({ trip, cities: propCities = [], setCities, ref
       <nav style={s.navbar}>
         <div style={s.navBrand}><span style={s.navLogo}>✈</span><span style={s.navTitle}>Traveloop</span></div>
         <button style={s.avatar} onClick={() => setScreen?.("profile")}>
-          {user?.photo_url ? <img src={user.photo_url} alt="av" style={s.avatarImg} /> : initials}
+          {user?.photo_url ? <img src={assetUrl(user.photo_url)} alt="av" style={s.avatarImg} /> : initials}
         </button>
       </nav>
 
@@ -363,7 +364,7 @@ export function ActivitySearchScreen({ trip, refreshTrip, token, user, setScreen
       <nav style={s.navbar}>
         <div style={s.navBrand}><span style={s.navLogo}>✈</span><span style={s.navTitle}>Traveloop</span></div>
         <button style={s.avatar} onClick={() => setScreen?.("profile")}>
-          {user?.photo_url ? <img src={user.photo_url} alt="av" style={s.avatarImg} /> : initials}
+          {user?.photo_url ? <img src={assetUrl(user.photo_url)} alt="av" style={s.avatarImg} /> : initials}
         </button>
       </nav>
 
@@ -459,104 +460,389 @@ export function ActivitySearchScreen({ trip, refreshTrip, token, user, setScreen
 /* ════════════════════════════════════════════
    COMMUNITY
 ════════════════════════════════════════════ */
-export function CommunityScreen({ user, setScreen, token }) {
-  const [allTrips, setAllTrips] = useState([]);
+export function CommunityScreen({ user, setScreen }) {
+  const [posts, setPosts] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [notice, setNotice] = useState("");
+  const [compose, setCompose] = useState({ body: "", category: "General" });
+  const [editingPostId, setEditingPostId] = useState(null);
+  const [editPost, setEditPost] = useState({ body: "", category: "General" });
+  const [commentDrafts, setCommentDrafts] = useState({});
+  const [editingCommentId, setEditingCommentId] = useState(null);
+  const [editCommentBody, setEditCommentBody] = useState("");
 
-  /* toolbar */
   const [query, setQuery] = useState("");
   const [groupBy, setGroupBy] = useState("");
   const [sortBy, setSortBy] = useState("recent");
+  const [categoryFilter, setCategoryFilter] = useState("");
+  const [activityFilter, setActivityFilter] = useState("all");
+
+  const categories = ["General", "Trip Tips", "Questions", "Food", "Budget", "Safety"];
 
   useEffect(() => {
-    setLoading(true);
-    fetch(`${API_BASE}/api/community`)
-      .then((r) => r.json())
-      .then((d) => setAllTrips(d.trips ?? []))
-      .catch(() => {})
-      .finally(() => setLoading(false));
+    loadCommunity();
   }, []);
 
+  async function loadCommunity() {
+    setLoading(true);
+    setNotice("");
+    try {
+      const payload = await api.community();
+      setPosts(payload.posts ?? []);
+    } catch (err) {
+      setNotice(err.message || "Could not load community posts.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function replacePost(nextPost) {
+    setPosts((current) => current.map((post) => (post.id === nextPost.id ? nextPost : post)));
+  }
+
+  async function createPost(event) {
+    event.preventDefault();
+    const body = compose.body.trim();
+    if (!body) return;
+    try {
+      const payload = await api.createCommunityPost({ body, category: compose.category });
+      setPosts((current) => [payload.post, ...current]);
+      setCompose({ body: "", category: "General" });
+      setNotice("");
+    } catch (err) {
+      setNotice(err.message || "Post failed.");
+    }
+  }
+
+  function startPostEdit(post) {
+    setEditingPostId(post.id);
+    setEditPost({ body: post.body, category: post.category || "General" });
+  }
+
+  async function savePostEdit(postId) {
+    try {
+      const payload = await api.updateCommunityPost(postId, editPost);
+      replacePost(payload.post);
+      setEditingPostId(null);
+      setNotice("");
+    } catch (err) {
+      setNotice(err.message || "Could not update post.");
+    }
+  }
+
+  async function removePost(postId) {
+    if (!confirm("Delete this community post?")) return;
+    try {
+      await api.deleteCommunityPost(postId);
+      setPosts((current) => current.filter((post) => post.id !== postId));
+    } catch (err) {
+      setNotice(err.message || "Could not delete post.");
+    }
+  }
+
+  async function toggleLike(postId) {
+    try {
+      const payload = await api.toggleCommunityLike(postId);
+      replacePost(payload.post);
+    } catch (err) {
+      setNotice(err.message || "Could not update like.");
+    }
+  }
+
+  async function addComment(postId) {
+    const body = (commentDrafts[postId] || "").trim();
+    if (!body) return;
+    try {
+      const payload = await api.createCommunityComment(postId, { body });
+      replacePost(payload.post);
+      setCommentDrafts((current) => ({ ...current, [postId]: "" }));
+      setNotice("");
+    } catch (err) {
+      setNotice(err.message || "Could not add comment.");
+    }
+  }
+
+  function startCommentEdit(comment) {
+    setEditingCommentId(comment.id);
+    setEditCommentBody(comment.body);
+  }
+
+  async function saveCommentEdit(commentId) {
+    const body = editCommentBody.trim();
+    if (!body) return;
+    try {
+      const payload = await api.updateCommunityComment(commentId, { body });
+      replacePost(payload.post);
+      setEditingCommentId(null);
+      setEditCommentBody("");
+    } catch (err) {
+      setNotice(err.message || "Could not update comment.");
+    }
+  }
+
+  async function removeComment(commentId) {
+    try {
+      const payload = await api.deleteCommunityComment(commentId);
+      replacePost(payload.post);
+    } catch (err) {
+      setNotice(err.message || "Could not delete comment.");
+    }
+  }
+
   const filtered = useMemo(() => {
-    let list = [...allTrips];
-    if (query) { const q = query.toLowerCase(); list = list.filter((t) => t.name?.toLowerCase().includes(q) || t.owner_name?.toLowerCase().includes(q) || t.description?.toLowerCase().includes(q)); }
-    if (sortBy === "name") list.sort((a, b) => a.name?.localeCompare(b.name));
-    else if (sortBy === "stops") list.sort((a, b) => (b.destination_count ?? 0) - (a.destination_count ?? 0));
+    let list = [...posts];
+    if (query) {
+      const q = query.toLowerCase();
+      list = list.filter((post) =>
+        post.body?.toLowerCase().includes(q) ||
+        post.owner_name?.toLowerCase().includes(q) ||
+        post.category?.toLowerCase().includes(q) ||
+        post.comments?.some((comment) => comment.body?.toLowerCase().includes(q) || comment.owner_name?.toLowerCase().includes(q))
+      );
+    }
+    if (categoryFilter) list = list.filter((post) => post.category === categoryFilter);
+    if (activityFilter === "mine") list = list.filter((post) => post.user_id === user?.id);
+    if (activityFilter === "liked") list = list.filter((post) => post.liked_by_me);
+    if (activityFilter === "commented") list = list.filter((post) => post.comments?.some((comment) => comment.user_id === user?.id));
+
+    if (sortBy === "oldest") list.sort((a, b) => (a.created_at || "").localeCompare(b.created_at || ""));
+    else if (sortBy === "likes") list.sort((a, b) => (b.likes_count ?? 0) - (a.likes_count ?? 0));
+    else if (sortBy === "comments") list.sort((a, b) => (b.comments_count ?? 0) - (a.comments_count ?? 0));
+    else if (sortBy === "author") list.sort((a, b) => (a.owner_name || "").localeCompare(b.owner_name || ""));
+    else list.sort((a, b) => (b.created_at || "").localeCompare(a.created_at || ""));
     return list;
-  }, [allTrips, query, sortBy]);
+  }, [posts, query, categoryFilter, activityFilter, sortBy, user?.id]);
 
   const grouped = useMemo(() => {
     if (!groupBy) return { "": filtered };
     const map = {};
-    filtered.forEach((t) => {
-      const key = groupBy === "owner" ? (t.owner_name || "Unknown") : "All";
-      (map[key] = map[key] || []).push(t);
+    filtered.forEach((post) => {
+      let key = "All";
+      if (groupBy === "owner") key = post.owner_name || "Unknown";
+      if (groupBy === "category") key = post.category || "General";
+      if (groupBy === "date") key = post.created_at?.slice(0, 10) || "Unknown date";
+      (map[key] = map[key] || []).push(post);
     });
     return map;
   }, [filtered, groupBy]);
 
   const initials = (user?.name ?? "T").split(" ").map((w) => w[0]).join("").slice(0, 2).toUpperCase();
+  const avatarFor = (name = "U", photo = "") => {
+    const letters = name.split(" ").map((part) => part[0]).join("").slice(0, 2).toUpperCase();
+    return photo ? <img src={assetUrl(photo)} alt={name} style={s.avatarImg} /> : letters;
+  };
+  const dateLabel = (value) => value ? new Date(value).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "";
 
   return (
     <div style={s.root}>
       <nav style={s.navbar}>
-        <div style={s.navBrand}><span style={s.navLogo}>✈</span><span style={s.navTitle}>Traveloop</span></div>
+        <div style={s.navBrand}><span style={s.navLogo}>T</span><span style={s.navTitle}>Traveloop</span></div>
         <button style={s.avatar} onClick={() => setScreen?.("profile")}>
-          {user?.photo_url ? <img src={user.photo_url} alt="av" style={s.avatarImg} /> : initials}
+          {user?.photo_url ? <img src={assetUrl(user.photo_url)} alt="av" style={s.avatarImg} /> : initials}
         </button>
       </nav>
 
       <div style={s.body}>
         <div style={s.pageHeader}>
           <div>
-            <p style={s.eyebrow}>Community</p>
-            <h1 style={s.pageTitle}>Shared trip inspiration</h1>
+            <p style={s.eyebrow}>Community Tab Screen</p>
+            <h1 style={s.pageTitle}>Community tab</h1>
           </div>
         </div>
 
         <SearchToolbar
           query={query}
           setQuery={setQuery}
-          placeholder="Search trips or travelers…"
-          groupOptions={[{ value: "owner", label: "Traveler" }]}
+          placeholder="Search posts, users, or comments..."
+          groupOptions={[
+            { value: "owner", label: "Traveler" },
+            { value: "category", label: "Category" },
+            { value: "date", label: "Date" },
+          ]}
           groupBy={groupBy}
           setGroupBy={setGroupBy}
           sortOptions={[
             { value: "recent", label: "Most Recent" },
-            { value: "stops", label: "Most Stops" },
-            { value: "name", label: "Name A–Z" },
+            { value: "oldest", label: "Oldest" },
+            { value: "likes", label: "Most Likes" },
+            { value: "comments", label: "Most Comments" },
+            { value: "author", label: "Author A-Z" },
           ]}
           sortBy={sortBy}
           setSortBy={setSortBy}
+          filterContent={({ close }) => (
+            <>
+              <p style={s.filterHeading}>Category</p>
+              {["", ...categories].map((category) => (
+                <button
+                  key={category || "all"}
+                  style={{ ...s.filterChip, background: categoryFilter === category ? "#1a1a2e" : "#f0f0f5", color: categoryFilter === category ? "#fff" : "#333" }}
+                  onClick={() => { setCategoryFilter(category); close(); }}
+                >
+                  {category || "All categories"}
+                </button>
+              ))}
+              <p style={{ ...s.filterHeading, marginTop: 12 }}>Activity</p>
+              {[
+                ["all", "All posts"],
+                ["mine", "My posts"],
+                ["liked", "Liked by me"],
+                ["commented", "Commented by me"],
+              ].map(([value, label]) => (
+                <button
+                  key={value}
+                  style={{ ...s.filterChip, background: activityFilter === value ? "#1a1a2e" : "#f0f0f5", color: activityFilter === value ? "#fff" : "#333" }}
+                  onClick={() => { setActivityFilter(value); close(); }}
+                >
+                  {label}
+                </button>
+              ))}
+            </>
+          )}
         />
 
+        <form style={s.communityComposer} onSubmit={createPost}>
+          <button type="button" style={s.avatar} onClick={() => setScreen?.("profile")} title={user?.name}>
+            {avatarFor(user?.name, user?.photo_url)}
+          </button>
+          <div style={s.composerBody}>
+            <textarea
+              style={s.postTextarea}
+              rows={3}
+              placeholder="Share your trip experience, tip, question, or update..."
+              value={compose.body}
+              onChange={(e) => setCompose((current) => ({ ...current, body: e.target.value }))}
+            />
+            <div style={s.composerActions}>
+              <select
+                style={s.controlSelect}
+                value={compose.category}
+                onChange={(e) => setCompose((current) => ({ ...current, category: e.target.value }))}
+              >
+                {categories.map((category) => <option key={category}>{category}</option>)}
+              </select>
+              <button style={s.postBtn} disabled={!compose.body.trim()}>Post</button>
+            </div>
+          </div>
+        </form>
+
+        {notice && <div style={s.communityNotice}>{notice}</div>}
+
         {loading ? (
-          <div style={s.communityGrid}>
-            {Array.from({ length: 6 }).map((_, i) => <div key={i} style={s.skeletonCard} />)}
+          <div style={s.communityFeed}>
+            {Array.from({ length: 4 }).map((_, i) => <div key={i} style={s.communitySkeleton} />)}
           </div>
         ) : filtered.length === 0 ? (
-          <div style={s.emptyState}><span style={{ fontSize: 40 }}>🌍</span><p>No shared trips found.</p></div>
+          <div style={s.emptyState}><span style={{ fontSize: 40 }}>+</span><p>No community posts found.</p></div>
         ) : (
           Object.entries(grouped).map(([group, list]) => (
             <div key={group}>
               {group && <p style={s.groupLabel}>{group}</p>}
-              <div style={s.communityGrid}>
-                {list.map((trip) => (
-                  <article key={trip.id} style={s.communityCard}>
-                    <div style={s.cityImgWrap}>
-                      <img src={trip.cover_photo || FALLBACK} alt={trip.name} style={s.cityImg} onError={(e) => (e.target.src = FALLBACK)} />
-                      <div style={s.cityImgOverlay} />
-                      <span style={s.regionBadge}>📍 {trip.destination_count} stops</span>
-                    </div>
-                    <div style={s.cityBody}>
-                      <strong style={s.cityName}>{trip.name}</strong>
-                      <span style={s.cityCountry}>by {trip.owner_name}</span>
-                      {trip.description && <p style={s.cityDesc}>{trip.description}</p>}
-                    </div>
-                    <div style={s.cardActions}>
-                      <button style={s.addBtn} onClick={() => window.open(`/?public=${trip.public_token}`, "_blank")}>
-                        🔗 View Public Plan
-                      </button>
+              <div style={s.communityFeed}>
+                {list.map((post) => (
+                  <article key={post.id} style={s.feedPost}>
+                    <div style={s.feedAvatar}>{avatarFor(post.owner_name, post.owner_photo)}</div>
+                    <div style={s.postCard}>
+                      <div style={s.postHeader}>
+                        <div>
+                          <strong style={s.postAuthor}>{post.owner_name}</strong>
+                          <span style={s.postMeta}>{post.category || "General"} | {dateLabel(post.created_at)}</span>
+                        </div>
+                        {post.can_edit && (
+                          <div style={s.ownerActions}>
+                            <button type="button" style={s.textBtn} onClick={() => startPostEdit(post)}>Edit</button>
+                            <button type="button" style={s.dangerTextBtn} onClick={() => removePost(post.id)}>Delete</button>
+                          </div>
+                        )}
+                      </div>
+
+                      {editingPostId === post.id ? (
+                        <div style={s.editBox}>
+                          <textarea
+                            style={s.postTextarea}
+                            rows={3}
+                            value={editPost.body}
+                            onChange={(e) => setEditPost((current) => ({ ...current, body: e.target.value }))}
+                          />
+                          <div style={s.composerActions}>
+                            <select
+                              style={s.controlSelect}
+                              value={editPost.category}
+                              onChange={(e) => setEditPost((current) => ({ ...current, category: e.target.value }))}
+                            >
+                              {categories.map((category) => <option key={category}>{category}</option>)}
+                            </select>
+                            <button type="button" style={s.saveBtnDark} onClick={() => savePostEdit(post.id)}>Save</button>
+                            <button type="button" style={s.saveBtn} onClick={() => setEditingPostId(null)}>Cancel</button>
+                          </div>
+                        </div>
+                      ) : (
+                        <p style={s.postBodyText}>{post.body}</p>
+                      )}
+
+                      <div style={s.postStats}>
+                        <button
+                          type="button"
+                          style={{ ...s.likeBtn, ...(post.liked_by_me ? s.likeBtnActive : {}) }}
+                          onClick={() => toggleLike(post.id)}
+                        >
+                          Like {post.likes_count ? `(${post.likes_count})` : ""}
+                        </button>
+                        <span>{post.comments_count || 0} comments</span>
+                      </div>
+
+                      <div style={s.commentsList}>
+                        {post.comments?.map((comment) => (
+                          <div key={comment.id} style={s.commentRow}>
+                            <div style={s.commentAvatar}>{avatarFor(comment.owner_name, comment.owner_photo)}</div>
+                            <div style={s.commentBubble}>
+                              <div style={s.commentHead}>
+                                <strong>{comment.owner_name}</strong>
+                                <span>{dateLabel(comment.created_at)}</span>
+                              </div>
+                              {editingCommentId === comment.id ? (
+                                <div style={s.commentEdit}>
+                                  <input
+                                    style={s.commentInput}
+                                    value={editCommentBody}
+                                    onChange={(e) => setEditCommentBody(e.target.value)}
+                                    onKeyDown={(e) => e.key === "Enter" && saveCommentEdit(comment.id)}
+                                  />
+                                  <button type="button" style={s.textBtn} onClick={() => saveCommentEdit(comment.id)}>Save</button>
+                                  <button type="button" style={s.textBtn} onClick={() => setEditingCommentId(null)}>Cancel</button>
+                                </div>
+                              ) : (
+                                <p>{comment.body}</p>
+                              )}
+                              {comment.can_edit && editingCommentId !== comment.id && (
+                                <div style={s.commentActions}>
+                                  <button type="button" style={s.textBtn} onClick={() => startCommentEdit(comment)}>Edit</button>
+                                  <button type="button" style={s.dangerTextBtn} onClick={() => removeComment(comment.id)}>Delete</button>
+                                </div>
+                              )}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+
+                      <div style={s.commentComposer}>
+                        <div style={s.commentAvatar}>{avatarFor(user?.name, user?.photo_url)}</div>
+                        <input
+                          style={s.commentInput}
+                          placeholder="Add a comment..."
+                          value={commentDrafts[post.id] || ""}
+                          onChange={(e) => setCommentDrafts((current) => ({ ...current, [post.id]: e.target.value }))}
+                          onKeyDown={(e) => e.key === "Enter" && addComment(post.id)}
+                        />
+                        <button
+                          type="button"
+                          style={s.commentBtn}
+                          disabled={!(commentDrafts[post.id] || "").trim()}
+                          onClick={() => addComment(post.id)}
+                        >
+                          Comment
+                        </button>
+                      </div>
                     </div>
                   </article>
                 ))}
@@ -608,12 +894,43 @@ const s = {
   /* grids */
   cityGrid: { display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))", gap: 18, marginBottom: 24 },
   actGrid: { display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(260px, 1fr))", gap: 18, marginBottom: 24 },
-  communityGrid: { display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))", gap: 18, marginBottom: 24 },
+  communityFeed: { display: "flex", flexDirection: "column", gap: 16, marginBottom: 24 },
 
   /* cards */
   cityCard: { background: "#fff", borderRadius: 14, overflow: "hidden", border: "1px solid #ececec", boxShadow: "0 2px 10px rgba(0,0,0,0.07)", display: "flex", flexDirection: "column" },
   actCard: { background: "#fff", borderRadius: 14, overflow: "hidden", border: "1px solid #ececec", boxShadow: "0 2px 10px rgba(0,0,0,0.07)", display: "flex", flexDirection: "column" },
-  communityCard: { background: "#fff", borderRadius: 14, overflow: "hidden", border: "1px solid #ececec", boxShadow: "0 2px 10px rgba(0,0,0,0.07)", display: "flex", flexDirection: "column" },
+  communityComposer: { background: "#fff", border: "1px solid #ececec", borderRadius: 12, padding: 14, display: "flex", gap: 12, alignItems: "flex-start", marginBottom: 16, boxShadow: "0 2px 10px rgba(0,0,0,0.06)" },
+  composerBody: { flex: 1, display: "flex", flexDirection: "column", gap: 10 },
+  composerActions: { display: "flex", gap: 8, alignItems: "center", justifyContent: "space-between", flexWrap: "wrap" },
+  postTextarea: { width: "100%", boxSizing: "border-box", resize: "vertical", border: "1.5px solid #e0e0e8", borderRadius: 10, padding: "10px 12px", fontSize: 14, lineHeight: 1.5, color: "#1a1a2e", outline: "none", fontFamily: "inherit", background: "#fff" },
+  postBtn: { background: "#1a1a2e", color: "#fff", border: "none", borderRadius: 8, padding: "9px 18px", fontSize: 13, fontWeight: 800, cursor: "pointer" },
+  communityNotice: { background: "#fff8e1", border: "1px solid #f3d37a", color: "#7a5b00", borderRadius: 10, padding: "10px 12px", marginBottom: 14, fontSize: 13, fontWeight: 700 },
+  feedPost: { display: "grid", gridTemplateColumns: "42px minmax(0, 1fr)", gap: 10, alignItems: "start" },
+  feedAvatar: { width: 38, height: 38, borderRadius: "50%", background: "#1a1a2e", color: "#fff", display: "flex", alignItems: "center", justifyContent: "center", overflow: "hidden", fontWeight: 800, fontSize: 13 },
+  postCard: { background: "#fff", border: "1px solid #e7e7ef", borderRadius: 10, padding: 14, boxShadow: "0 2px 10px rgba(0,0,0,0.06)" },
+  postHeader: { display: "flex", justifyContent: "space-between", gap: 12, alignItems: "flex-start", marginBottom: 8 },
+  postAuthor: { display: "block", color: "#1a1a2e", fontSize: 14, fontWeight: 900 },
+  postMeta: { display: "block", color: "#7b7b8d", fontSize: 11, fontWeight: 700, marginTop: 2 },
+  ownerActions: { display: "flex", gap: 8, alignItems: "center", flexShrink: 0 },
+  textBtn: { border: "none", background: "transparent", color: "#3949ab", fontWeight: 800, fontSize: 12, cursor: "pointer", padding: "2px 0" },
+  dangerTextBtn: { border: "none", background: "transparent", color: "#c62828", fontWeight: 800, fontSize: 12, cursor: "pointer", padding: "2px 0" },
+  editBox: { display: "flex", flexDirection: "column", gap: 8 },
+  saveBtnDark: { border: "none", borderRadius: 8, padding: "8px 14px", background: "#1a1a2e", color: "#fff", fontWeight: 800, cursor: "pointer" },
+  postBodyText: { margin: "8px 0 10px", color: "#2b2b3b", fontSize: 14, lineHeight: 1.55, whiteSpace: "pre-wrap" },
+  postStats: { borderTop: "1px solid #f0f0f5", borderBottom: "1px solid #f0f0f5", padding: "8px 0", display: "flex", gap: 14, alignItems: "center", color: "#6f6f80", fontSize: 12, fontWeight: 800 },
+  likeBtn: { border: "none", background: "transparent", color: "#55566a", fontSize: 12, fontWeight: 900, cursor: "pointer", padding: 0 },
+  likeBtnActive: { color: "#c62828" },
+  commentsList: { display: "flex", flexDirection: "column", gap: 10, paddingTop: 12 },
+  commentRow: { display: "grid", gridTemplateColumns: "30px minmax(0, 1fr)", gap: 8, alignItems: "start" },
+  commentAvatar: { width: 28, height: 28, borderRadius: "50%", background: "#e8eaf6", color: "#1a1a2e", display: "flex", alignItems: "center", justifyContent: "center", overflow: "hidden", fontSize: 10, fontWeight: 900, flexShrink: 0 },
+  commentBubble: { background: "#f6f6fa", borderRadius: 10, padding: "8px 10px", minWidth: 0 },
+  commentHead: { display: "flex", gap: 8, alignItems: "baseline", flexWrap: "wrap", marginBottom: 3 },
+  commentEdit: { display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" },
+  commentActions: { display: "flex", gap: 8, marginTop: 4 },
+  commentComposer: { display: "grid", gridTemplateColumns: "30px minmax(0, 1fr) auto", gap: 8, alignItems: "center", marginTop: 12 },
+  commentInput: { border: "1.5px solid #e0e0e8", borderRadius: 18, padding: "8px 12px", outline: "none", fontSize: 13, minWidth: 0, fontFamily: "inherit" },
+  commentBtn: { border: "none", borderRadius: 18, padding: "8px 12px", background: "#1a1a2e", color: "#fff", fontWeight: 800, fontSize: 12, cursor: "pointer" },
+  communitySkeleton: { borderRadius: 10, height: 170, background: "linear-gradient(90deg,#f0f0f5 25%,#e4e4ee 50%,#f0f0f5 75%)", backgroundSize: "200% 100%", animation: "shimmer 1.4s infinite", border: "1px solid #ececec" },
 
   /* image */
   cityImgWrap: { position: "relative", height: 160, overflow: "hidden", background: "#eee" },
