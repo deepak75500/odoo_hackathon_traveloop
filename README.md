@@ -7,7 +7,9 @@ The project is split into:
 - `backend/`: FastAPI API server with SQLite storage.
 - `frontend/`: React + Vite single page application.
 - `backend/traveloop.sqlite3`: local SQLite database used by the backend.
+## Architecture Diagram
 
+![Traveloop Architecture](https://github.com/deepak75500/odoo_hackathon_traveloop/blob/main/architecture_of_traveloop.png?raw=true)
 ## Quick Start
 
 ### 1. Start The Backend
