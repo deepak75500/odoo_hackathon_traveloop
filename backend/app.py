@@ -68,12 +68,6 @@ def startup():
 # Helpers
 # ---------------------------------------------------------------------------
 
-def as_int(value: Any, default: int = 0) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
-
 
 def as_float(value: Any, default: float = 0.0) -> float:
     try:
@@ -100,18 +94,6 @@ def days_range(start: str, end: str) -> list[str]:
     return [(first + timedelta(days=i)).isoformat() for i in range(day_span(start, end, True))]
 
 
-def not_found(msg: str = "Not found"):
-    raise HTTPException(status_code=404, detail=msg)
-
-
-def bad_request(msg: str):
-    raise HTTPException(status_code=400, detail=msg)
-
-
-def forbidden(msg: str = "Forbidden"):
-    raise HTTPException(status_code=403, detail=msg)
-
-
 # ---------------------------------------------------------------------------
 # Auth dependency
 # ---------------------------------------------------------------------------
@@ -127,6 +109,10 @@ def get_current_user(authorization: str = Header(default="")):
                 (token,),
             ).fetchone()
         )
+        try:
+            conn.execute("ALTER TABLE stops ADD COLUMN budget REAL DEFAULT 0")
+        except Exception:
+            pass   # Column already exists — safe to ignore
     if not user:
         raise HTTPException(status_code=401, detail="Invalid session")
     return user
@@ -190,12 +176,14 @@ class TripBody(BaseModel):
     budget_limit: float = 0.0
 
 
+ 
 class StopBody(BaseModel):
     city_id: int = 0
     start_date: str = ""
     end_date: str = ""
     sort_order: int = 0
     transport_cost: float = 0.0
+    budget: float = 0.0          # ← NEW: per-section budget
     notes: str = ""
 
 
@@ -230,6 +218,15 @@ class NoteBody(BaseModel):
     body: str = ""
     note_date: str = ""
     stop_id: Optional[int] = None
+
+
+class CommunityPostBody(BaseModel):
+    body: str = ""
+    category: str = "General"
+
+
+class CommunityCommentBody(BaseModel):
+    body: str = ""
 
 
 class SaveCityBody(BaseModel):
@@ -716,10 +713,13 @@ def add_stop(trip_id: int, body: StopBody, user: dict = Depends(get_current_user
             "SELECT COALESCE(MAX(sort_order),0)+1 AS n FROM stops WHERE trip_id=?", (trip_id,)
         ).fetchone()["n"]
         stop_id = conn.execute(
-            "INSERT INTO stops (trip_id,city_id,start_date,end_date,sort_order,transport_cost,notes) VALUES (?,?,?,?,?,?,?)",
+            "INSERT INTO stops (trip_id,city_id,start_date,end_date,sort_order,transport_cost,budget,notes) VALUES (?,?,?,?,?,?,?,?)",
             (
                 trip_id, body.city_id, body.start_date, body.end_date,
-                body.sort_order or order, body.transport_cost, body.notes,
+                body.sort_order or order,
+                body.transport_cost,
+                body.budget,           # ← NEW
+                body.notes,
             ),
         ).lastrowid
         stop = one(conn.execute("SELECT * FROM stops WHERE id=?", (stop_id,)).fetchone())
@@ -731,20 +731,19 @@ def update_stop(stop_id: int, body: StopBody, user: dict = Depends(get_current_u
     with connect() as conn:
         stop = get_own_stop(conn, user, stop_id)
         conn.execute(
-            "UPDATE stops SET city_id=?,start_date=?,end_date=?,sort_order=?,transport_cost=?,notes=? WHERE id=?",
+            "UPDATE stops SET city_id=?,start_date=?,end_date=?,sort_order=?,transport_cost=?,budget=?,notes=? WHERE id=?",
             (
                 body.city_id or stop["city_id"],
                 txt(body.start_date, stop["start_date"]),
                 txt(body.end_date, stop["end_date"]),
                 body.sort_order or stop["sort_order"],
                 body.transport_cost if body.transport_cost else as_float(stop["transport_cost"]),
+                body.budget if body.budget else as_float(stop.get("budget", 0)),   # ← NEW
                 txt(body.notes, stop["notes"]),
                 stop_id,
             ),
         )
         return {"stop": one(conn.execute("SELECT * FROM stops WHERE id=?", (stop_id,)).fetchone())}
-
-
 @app.delete("/api/stops/{stop_id}")
 def delete_stop(stop_id: int, user: dict = Depends(get_current_user)):
     with connect() as conn:
@@ -963,16 +962,175 @@ def public_trip(token: str):
 
 
 @app.get("/api/community")
-def community():
+def community(user: dict = Depends(get_current_user)):
     with connect() as conn:
-        return {"trips": [dict(r) for r in conn.execute(
+        posts = [community_post_payload(conn, row["id"], user["id"]) for row in conn.execute(
             """
-            SELECT t.id,t.name,t.description,t.start_date,t.end_date,t.cover_photo,
-                   t.public_token,u.name AS owner_name, COUNT(s.id) AS destination_count
-            FROM trips t JOIN users u ON u.id=t.user_id LEFT JOIN stops s ON s.trip_id=t.id
-            WHERE t.is_public=1 GROUP BY t.id ORDER BY t.updated_at DESC
+            SELECT p.id
+            FROM community_posts p
+            ORDER BY p.created_at DESC
             """
-        )]}
+        )]
+    return {"posts": posts}
+
+
+def community_post_payload(conn, post_id: int, current_user_id: int) -> dict:
+    post = one(conn.execute(
+        """
+        SELECT
+          p.*,
+          u.name AS owner_name,
+          u.photo_url AS owner_photo,
+          u.city AS owner_city,
+          u.country AS owner_country,
+          (SELECT COUNT(*) FROM community_likes l WHERE l.post_id=p.id) AS likes_count,
+          (SELECT COUNT(*) FROM community_comments c WHERE c.post_id=p.id) AS comments_count,
+          EXISTS(
+            SELECT 1 FROM community_likes l
+            WHERE l.post_id=p.id AND l.user_id=?
+          ) AS liked_by_me
+        FROM community_posts p
+        JOIN users u ON u.id=p.user_id
+        WHERE p.id=?
+        """,
+        (current_user_id, post_id),
+    ).fetchone())
+    if not post:
+        raise HTTPException(status_code=404, detail="Community post not found")
+
+    post["liked_by_me"] = bool(post["liked_by_me"])
+    post["can_edit"] = post["user_id"] == current_user_id
+    post["comments"] = [dict(row) for row in conn.execute(
+        """
+        SELECT
+          c.*,
+          u.name AS owner_name,
+          u.photo_url AS owner_photo,
+          CASE WHEN c.user_id=? THEN 1 ELSE 0 END AS can_edit
+        FROM community_comments c
+        JOIN users u ON u.id=c.user_id
+        WHERE c.post_id=?
+        ORDER BY c.created_at ASC
+        """,
+        (current_user_id, post_id),
+    )]
+    for comment in post["comments"]:
+        comment["can_edit"] = bool(comment["can_edit"])
+    return post
+
+
+@app.post("/api/community")
+def create_community_post(body: CommunityPostBody, user: dict = Depends(get_current_user)):
+    post_body = txt(body.body)
+    if not post_body:
+        raise HTTPException(status_code=400, detail="Community message is required")
+    with connect() as conn:
+        post_id = conn.execute(
+            """
+            INSERT INTO community_posts (user_id,body,category,created_at,updated_at)
+            VALUES (?,?,?,?,?)
+            """,
+            (user["id"], post_body, txt(body.category, "General") or "General", now(), now()),
+        ).lastrowid
+        return {"post": community_post_payload(conn, post_id, user["id"])}
+
+
+@app.put("/api/community/{post_id}")
+def update_community_post(post_id: int, body: CommunityPostBody, user: dict = Depends(get_current_user)):
+    post_body = txt(body.body)
+    if not post_body:
+        raise HTTPException(status_code=400, detail="Community message is required")
+    with connect() as conn:
+        post = one(conn.execute("SELECT * FROM community_posts WHERE id=?", (post_id,)).fetchone())
+        if not post:
+            raise HTTPException(status_code=404, detail="Community post not found")
+        if post["user_id"] != user["id"]:
+            raise HTTPException(status_code=403, detail="Only the post owner can edit this message")
+        conn.execute(
+            "UPDATE community_posts SET body=?,category=?,updated_at=? WHERE id=?",
+            (post_body, txt(body.category, post["category"]) or "General", now(), post_id),
+        )
+        return {"post": community_post_payload(conn, post_id, user["id"])}
+
+
+@app.delete("/api/community/{post_id}")
+def delete_community_post(post_id: int, user: dict = Depends(get_current_user)):
+    with connect() as conn:
+        post = one(conn.execute("SELECT * FROM community_posts WHERE id=?", (post_id,)).fetchone())
+        if not post:
+            raise HTTPException(status_code=404, detail="Community post not found")
+        if post["user_id"] != user["id"]:
+            raise HTTPException(status_code=403, detail="Only the post owner can delete this message")
+        conn.execute("DELETE FROM community_posts WHERE id=?", (post_id,))
+    return {"ok": True}
+
+
+@app.post("/api/community/{post_id}/like")
+def toggle_community_like(post_id: int, user: dict = Depends(get_current_user)):
+    with connect() as conn:
+        if not conn.execute("SELECT id FROM community_posts WHERE id=?", (post_id,)).fetchone():
+            raise HTTPException(status_code=404, detail="Community post not found")
+        existing = conn.execute(
+            "SELECT 1 FROM community_likes WHERE post_id=? AND user_id=?",
+            (post_id, user["id"]),
+        ).fetchone()
+        if existing:
+            conn.execute("DELETE FROM community_likes WHERE post_id=? AND user_id=?", (post_id, user["id"]))
+        else:
+            conn.execute(
+                "INSERT INTO community_likes (post_id,user_id,created_at) VALUES (?,?,?)",
+                (post_id, user["id"], now()),
+            )
+        return {"post": community_post_payload(conn, post_id, user["id"])}
+
+
+@app.post("/api/community/{post_id}/comments")
+def create_community_comment(post_id: int, body: CommunityCommentBody, user: dict = Depends(get_current_user)):
+    comment_body = txt(body.body)
+    if not comment_body:
+        raise HTTPException(status_code=400, detail="Comment is required")
+    with connect() as conn:
+        if not conn.execute("SELECT id FROM community_posts WHERE id=?", (post_id,)).fetchone():
+            raise HTTPException(status_code=404, detail="Community post not found")
+        conn.execute(
+            """
+            INSERT INTO community_comments (post_id,user_id,body,created_at,updated_at)
+            VALUES (?,?,?,?,?)
+            """,
+            (post_id, user["id"], comment_body, now(), now()),
+        )
+        return {"post": community_post_payload(conn, post_id, user["id"])}
+
+
+@app.put("/api/community/comments/{comment_id}")
+def update_community_comment(comment_id: int, body: CommunityCommentBody, user: dict = Depends(get_current_user)):
+    comment_body = txt(body.body)
+    if not comment_body:
+        raise HTTPException(status_code=400, detail="Comment is required")
+    with connect() as conn:
+        comment = one(conn.execute("SELECT * FROM community_comments WHERE id=?", (comment_id,)).fetchone())
+        if not comment:
+            raise HTTPException(status_code=404, detail="Comment not found")
+        if comment["user_id"] != user["id"]:
+            raise HTTPException(status_code=403, detail="Only the comment owner can edit this comment")
+        conn.execute(
+            "UPDATE community_comments SET body=?,updated_at=? WHERE id=?",
+            (comment_body, now(), comment_id),
+        )
+        return {"post": community_post_payload(conn, comment["post_id"], user["id"])}
+
+
+@app.delete("/api/community/comments/{comment_id}")
+def delete_community_comment(comment_id: int, user: dict = Depends(get_current_user)):
+    with connect() as conn:
+        comment = one(conn.execute("SELECT * FROM community_comments WHERE id=?", (comment_id,)).fetchone())
+        if not comment:
+            raise HTTPException(status_code=404, detail="Comment not found")
+        if comment["user_id"] != user["id"]:
+            raise HTTPException(status_code=403, detail="Only the comment owner can delete this comment")
+        post_id = comment["post_id"]
+        conn.execute("DELETE FROM community_comments WHERE id=?", (comment_id,))
+        return {"post": community_post_payload(conn, post_id, user["id"])}
 
 
 # ---------------------------------------------------------------------------
@@ -1076,33 +1234,11 @@ def admin_delete_user(user_id: int, admin: dict = Depends(require_admin)):
         conn.execute("DELETE FROM users WHERE id=?", (user_id,))
     return {"ok": True}
 
-# ---------------------------------------------------------------------------
-# Add these imports at the top of app.py (alongside existing imports)
-# ---------------------------------------------------------------------------
-import os
-import uuid
-from fastapi import File, UploadFile
-from fastapi.staticfiles import StaticFiles
-
-# ---------------------------------------------------------------------------
-# Add this after app = FastAPI(...) and middleware setup
-# ---------------------------------------------------------------------------
-
-# Create uploads folder if it doesn't exist
-UPLOAD_DIR = "uploads/photos"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-
-# Serve the uploads folder as static files so frontend can display images
-app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
-
-# ---------------------------------------------------------------------------
-# Add this new route anywhere in app.py
-# ---------------------------------------------------------------------------
-
 @app.post("/api/upload/photo")
 async def upload_photo(
     file:    UploadFile = File(...),
     old_url: str        = Form(default=""),  # frontend sends current photo path to delete
+    authorization: str  = Header(default=""),
 ):
     allowed = {"image/jpeg", "image/png", "image/webp", "image/gif"}
     if file.content_type not in allowed:
@@ -1128,7 +1264,23 @@ async def upload_photo(
     with open(filepath, "wb") as f:
         f.write(contents)
 
-    return {"url": f"/uploads/photos/{filename}"}
+    url = f"/uploads/photos/{filename}"
+    updated_user = None
+
+    if authorization.startswith("Bearer "):
+        token = authorization.removeprefix("Bearer ").strip()
+        with connect() as conn:
+            row = conn.execute("SELECT user_id FROM sessions WHERE token=?", (token,)).fetchone()
+            if row:
+                conn.execute("UPDATE users SET photo_url=? WHERE id=?", (url, row["user_id"]))
+                updated_user = one(conn.execute("SELECT * FROM users WHERE id=?", (row["user_id"],)).fetchone())
+
+    response = {"url": url}
+    if updated_user:
+        response["user"] = safe_user(updated_user)
+    return response
+
+
 @app.post("/api/auth/forgot-password")
 def forgot_password(body: ForgotPasswordBody):
     email = body.email.strip().lower()
@@ -1208,587 +1360,6 @@ def reset_password(body: ResetPasswordBody):
             (token, user["id"], now()),
         )
     return {"token": token, "user": safe_user(user)}
-# ─────────────────────────────────────────────────────────────
-# ADD THESE ENDPOINTS TO YOUR EXISTING app.py
-# All use your existing g.db, ok(), err(), rows(), auth helpers
-# ─────────────────────────────────────────────────────────────
-
-
-# ── CITIES (Screen 3 Landing, Screen 4 Create, Screen 8 Search) ──
-
-@app.route("/api/cities")
-def get_cities():
-    """All cities with their activities nested."""
-    city_rows = rows(g.db.execute(
-        "SELECT * FROM cities ORDER BY popularity DESC"
-    ))
-    act_rows = rows(g.db.execute(
-        "SELECT * FROM activities ORDER BY city_id, name"
-    ))
-    act_map = {}
-    for a in act_rows:
-        act_map.setdefault(a["city_id"], []).append(a)
-    for c in city_rows:
-        c["activities"] = act_map.get(c["id"], [])
-    return ok(cities=city_rows)
-
-
-# ── TRIPS (Screens 3, 4, 6, 9) ────────────────────────────────
-
-@app.route("/api/trips")
-               # keep your existing decorator
-def get_trips():
-    """All trips for current user, with stops + activities nested."""
-    trip_rows = rows(g.db.execute(
-        "SELECT * FROM trips WHERE user_id=? ORDER BY start_date DESC",
-        (g.user["id"],)
-    ))
-    for trip in trip_rows:
-        trip["stops"] = _load_stops(trip["id"])
-        trip["expenses"] = rows(g.db.execute(
-            "SELECT * FROM expenses WHERE trip_id=?", (trip["id"],)
-        ))
-    return ok(trips=trip_rows)
-
-
-@app.route("/api/trips", methods=["POST"])
-
-def create_trip():
-    """Create a new trip (Screen 4)."""
-    b = request.get_json(silent=True) or {}
-    if not b.get("name") or not b.get("start_date") or not b.get("end_date"):
-        return err("name, start_date, end_date required")
-    ts = now()
-    cur = g.db.execute(
-        """INSERT INTO trips
-           (user_id,name,description,start_date,end_date,cover_photo,
-            budget_limit,is_public,created_at,updated_at)
-           VALUES (?,?,?,?,?,?,?,0,?,?)""",
-        (g.user["id"], b["name"], b.get("description",""),
-         b["start_date"], b["end_date"], b.get("cover_photo",""),
-         float(b.get("budget_limit") or 0), ts, ts)
-    )
-    trip = one(g.db.execute("SELECT * FROM trips WHERE id=?", (cur.lastrowid,)).fetchone())
-    trip["stops"] = []
-    trip["expenses"] = []
-    return ok(trip=trip), 201
-
-
-@app.route("/api/trips/<int:trip_id>")
-
-def get_trip(trip_id):
-    """Single trip with full nested data (Screen 9 Itinerary View)."""
-    trip = one(g.db.execute(
-        "SELECT * FROM trips WHERE id=? AND user_id=?",
-        (trip_id, g.user["id"])
-    ).fetchone())
-    if not trip:
-        return err("Trip not found", 404)
-    trip["stops"]     = _load_stops(trip_id)
-    trip["expenses"]  = rows(g.db.execute("SELECT * FROM expenses  WHERE trip_id=?", (trip_id,)))
-    trip["checklist"] = rows(g.db.execute("SELECT * FROM checklist_items WHERE trip_id=?", (trip_id,)))
-    trip["notes"]     = rows(g.db.execute("SELECT * FROM notes WHERE trip_id=? ORDER BY note_date", (trip_id,)))
-    return ok(trip=trip)
-
-
-@app.route("/api/trips/<int:trip_id>", methods=["PUT"])
-
-def update_trip(trip_id):
-    """Update trip details."""
-    trip = one(g.db.execute("SELECT * FROM trips WHERE id=? AND user_id=?", (trip_id, g.user["id"])).fetchone())
-    if not trip:
-        return err("Trip not found", 404)
-    b = request.get_json(silent=True) or {}
-    g.db.execute(
-        """UPDATE trips SET name=?,description=?,start_date=?,end_date=?,
-           cover_photo=?,budget_limit=?,updated_at=? WHERE id=?""",
-        (b.get("name", trip["name"]), b.get("description", trip["description"]),
-         b.get("start_date", trip["start_date"]), b.get("end_date", trip["end_date"]),
-         b.get("cover_photo", trip["cover_photo"]),
-         float(b.get("budget_limit") or trip["budget_limit"]),
-         now(), trip_id)
-    )
-    return ok(message="updated")
-
-
-@app.route("/api/trips/<int:trip_id>", methods=["DELETE"])
-
-def delete_trip(trip_id):
-    """Delete a trip (cascade handles stops, activities, expenses)."""
-    g.db.execute("DELETE FROM trips WHERE id=? AND user_id=?", (trip_id, g.user["id"]))
-    return ok(message="deleted")
-
-
-# ── STOPS (Screen 5 Build Itinerary) ──────────────────────────
-
-@app.route("/api/trips/<int:trip_id>/stops", methods=["POST"])
-
-def add_stop(trip_id):
-    """Add a stop to a trip."""
-    trip = one(g.db.execute("SELECT id FROM trips WHERE id=? AND user_id=?", (trip_id, g.user["id"])).fetchone())
-    if not trip:
-        return err("Trip not found", 404)
-    b = request.get_json(silent=True) or {}
-    if not b.get("city_id") or not b.get("start_date") or not b.get("end_date"):
-        return err("city_id, start_date, end_date required")
-    cur = g.db.execute(
-        """INSERT INTO stops (trip_id,city_id,start_date,end_date,sort_order,transport_cost,notes)
-           VALUES (?,?,?,?,?,?,?)""",
-        (trip_id, int(b["city_id"]), b["start_date"], b["end_date"],
-         int(b.get("sort_order") or 1),
-         float(b.get("transport_cost") or 0),
-         b.get("notes",""))
-    )
-    g.db.execute("UPDATE trips SET updated_at=? WHERE id=?", (now(), trip_id))
-    stop = _load_stop(cur.lastrowid)
-    return ok(stop=stop), 201
-
-
-@app.route("/api/stops/<int:stop_id>", methods=["DELETE"])
-
-def delete_stop(stop_id):
-    """Remove a stop (cascade removes planned activities)."""
-    g.db.execute("DELETE FROM stops WHERE id=?", (stop_id,))
-    return ok(message="deleted")
-
-
-# ── PLANNED ACTIVITIES (Screens 8, 9) ─────────────────────────
-
-@app.route("/api/stops/<int:stop_id>/activities", methods=["POST"])
-
-def add_planned_activity(stop_id):
-    """Plan an activity for a stop."""
-    b = request.get_json(silent=True) or {}
-    if not b.get("activity_id") or not b.get("activity_date"):
-        return err("activity_id and activity_date required")
-    cur = g.db.execute(
-        """INSERT INTO planned_activities
-           (stop_id,activity_id,activity_date,start_time,custom_cost,notes)
-           VALUES (?,?,?,?,?,?)""",
-        (stop_id, int(b["activity_id"]), b["activity_date"],
-         b.get("start_time","09:00"),
-         float(b["custom_cost"]) if b.get("custom_cost") is not None else None,
-         b.get("notes",""))
-    )
-    return ok(id=cur.lastrowid), 201
-
-
-@app.route("/api/planned/<int:planned_id>", methods=["DELETE"])
-
-def delete_planned_activity(planned_id):
-    """Remove a planned activity."""
-    g.db.execute("DELETE FROM planned_activities WHERE id=?", (planned_id,))
-    return ok(message="deleted")
-
-
-# ── EXPENSES (Screen 14 Invoice) ───────────────────────────────
-
-@app.route("/api/trips/<int:trip_id>/expenses", methods=["POST"])
-
-def add_expense(trip_id):
-    """Add an expense to a trip."""
-    trip = one(g.db.execute("SELECT id FROM trips WHERE id=? AND user_id=?", (trip_id, g.user["id"])).fetchone())
-    if not trip:
-        return err("Trip not found", 404)
-    b = request.get_json(silent=True) or {}
-    if not b.get("label") or b.get("amount") is None:
-        return err("label and amount required")
-    cur = g.db.execute(
-        "INSERT INTO expenses (trip_id,category,label,amount,expense_date) VALUES (?,?,?,?,?)",
-        (trip_id, b.get("category","extras"), b["label"],
-         float(b["amount"]), b.get("expense_date",""))
-    )
-    return ok(id=cur.lastrowid), 201
-
-
-@app.route("/api/expenses/<int:expense_id>", methods=["DELETE"])
-
-def delete_expense(expense_id):
-    """Delete an expense."""
-    g.db.execute("DELETE FROM expenses WHERE id=?", (expense_id,))
-    return ok(message="deleted")
-
-
-# ── SHARE / PUBLIC TOKEN (Share Screen) ───────────────────────
-
-@app.route("/api/trips/<int:trip_id>/share", methods=["POST"])
-
-def share_trip(trip_id):
-    """Generate or refresh a public token."""
-    trip = one(g.db.execute("SELECT * FROM trips WHERE id=? AND user_id=?", (trip_id, g.user["id"])).fetchone())
-    if not trip:
-        return err("Trip not found", 404)
-    token = trip["public_token"] or secrets.token_urlsafe(16)
-    g.db.execute(
-        "UPDATE trips SET is_public=1, public_token=?, updated_at=? WHERE id=?",
-        (token, now(), trip_id)
-    )
-    return ok(token=token)
-
-
-# ── PUBLIC ITINERARY (Screen 10 Community + PublicItinerary) ──
-
-@app.route("/api/public/trips")
-def public_trips():
-    """All public trips for Community tab (Screen 10)."""
-    trip_rows = rows(g.db.execute(
-        """SELECT t.*, u.name as owner_name, u.photo_url as owner_photo
-           FROM trips t JOIN users u ON u.id=t.user_id
-           WHERE t.is_public=1
-           ORDER BY t.updated_at DESC"""
-    ))
-    for trip in trip_rows:
-        trip["stops"] = _load_stops(trip["id"])
-    return ok(trips=trip_rows)
-
-
-@app.route("/api/public/<token>")
-def public_trip(token):
-    """Single public trip by token (PublicItinerary view)."""
-    trip = one(g.db.execute(
-        """SELECT t.*, u.name as owner_name
-           FROM trips t JOIN users u ON u.id=t.user_id
-           WHERE t.public_token=? AND t.is_public=1""",
-        (token,)
-    ).fetchone())
-    if not trip:
-        return err("Not found", 404)
-    trip["stops"] = _load_stops(trip["id"])
-    return ok(trip=trip)
-
-
-# ── SAVED DESTINATIONS (Profile Screen) ───────────────────────
-
-@app.route("/api/saved")
-
-def get_saved():
-    """Saved cities for current user."""
-    city_rows = rows(g.db.execute(
-        """SELECT c.* FROM cities c
-           JOIN saved_destinations sd ON sd.city_id=c.id
-           WHERE sd.user_id=? ORDER BY sd.created_at DESC""",
-        (g.user["id"],)
-    ))
-    return ok(cities=city_rows)
-
-
-@app.route("/api/saved/<int:city_id>", methods=["POST"])
-
-def save_city(city_id):
-    """Save a city to favourites."""
-    g.db.execute(
-        "INSERT OR IGNORE INTO saved_destinations (user_id,city_id,created_at) VALUES (?,?,?)",
-        (g.user["id"], city_id, now())
-    )
-    return ok(message="saved"), 201
-
-
-@app.route("/api/saved/<int:city_id>", methods=["DELETE"])
-
-def unsave_city(city_id):
-    """Remove a saved city."""
-    g.db.execute(
-        "DELETE FROM saved_destinations WHERE user_id=? AND city_id=?",
-        (g.user["id"], city_id)
-    )
-    return ok(message="removed")
-
-
-# ── CHECKLIST (Screen 11) ──────────────────────────────────────
-
-@app.route("/api/trips/<int:trip_id>/checklist", methods=["POST"])
-
-def add_checklist(trip_id):
-    """Add a checklist item."""
-    b = request.get_json(silent=True) or {}
-    if not b.get("label"):
-        return err("label required")
-    cur = g.db.execute(
-        "INSERT INTO checklist_items (trip_id,label,category,is_packed,created_at) VALUES (?,?,?,0,?)",
-        (trip_id, b["label"], b.get("category","General"), now())
-    )
-    return ok(id=cur.lastrowid), 201
-
-
-@app.route("/api/checklist/<int:item_id>", methods=["PUT"])
-
-def update_checklist(item_id):
-    """Toggle packed state."""
-    b = request.get_json(silent=True) or {}
-    g.db.execute(
-        "UPDATE checklist_items SET is_packed=?, label=?, category=? WHERE id=?",
-        (int(b.get("is_packed", 0)), b.get("label",""), b.get("category","General"), item_id)
-    )
-    return ok(message="updated")
-
-
-@app.route("/api/checklist/<int:item_id>", methods=["DELETE"])
-
-def delete_checklist(item_id):
-    """Delete a checklist item."""
-    g.db.execute("DELETE FROM checklist_items WHERE id=?", (item_id,))
-    return ok(message="deleted")
-
-
-# ── NOTES (Screen 13) ─────────────────────────────────────────
-
-@app.route("/api/trips/<int:trip_id>/notes", methods=["POST"])
-
-def add_note(trip_id):
-    """Add a trip note."""
-    b = request.get_json(silent=True) or {}
-    if not b.get("title") or not b.get("body"):
-        return err("title and body required")
-    cur = g.db.execute(
-        "INSERT INTO notes (trip_id,stop_id,title,body,note_date,created_at) VALUES (?,?,?,?,?,?)",
-        (trip_id, b.get("stop_id"), b["title"], b["body"],
-         b.get("note_date", now()[:10]), now())
-    )
-    return ok(id=cur.lastrowid), 201
-
-
-@app.route("/api/notes/<int:note_id>", methods=["DELETE"])
-
-def delete_note(note_id):
-    """Delete a note."""
-    g.db.execute("DELETE FROM notes WHERE id=?", (note_id,))
-    return ok(message="deleted")
-
-
-# ── ADMIN ANALYTICS (Screen 12) ───────────────────────────────
-
-@app.route("/api/admin/analytics")
-
-def analytics():
-    """Admin-only platform analytics."""
-    if g.user.get("role") != "admin":
-        return err("Admin only", 403)
-
-    counts = {
-        "users":        g.db.execute("SELECT COUNT(*) FROM users").fetchone()[0],
-        "trips":        g.db.execute("SELECT COUNT(*) FROM trips").fetchone()[0],
-        "planned":      g.db.execute("SELECT COUNT(*) FROM planned_activities").fetchone()[0],
-        "public_trips": g.db.execute("SELECT COUNT(*) FROM trips WHERE is_public=1").fetchone()[0],
-    }
-
-    trip_trends = rows(g.db.execute(
-        """SELECT substr(created_at,1,10) as date, COUNT(*) as trips
-           FROM trips GROUP BY date ORDER BY date DESC LIMIT 14"""
-    ))
-
-    trip_statuses = []
-    today = now()[:10]
-    for status, cond in [
-        ("Ongoing",   f"start_date<='{today}' AND end_date>='{today}'"),
-        ("Upcoming",  f"start_date>'{today}'"),
-        ("Completed", f"end_date<'{today}'"),
-    ]:
-        count = g.db.execute(f"SELECT COUNT(*) FROM trips WHERE {cond}").fetchone()[0]
-        trip_statuses.append({"status": status, "trips": count})
-
-    top_cities = rows(g.db.execute(
-        """SELECT c.name,c.country,c.region,c.cost_index,
-                  COUNT(s.id) as plans
-           FROM cities c LEFT JOIN stops s ON s.city_id=c.id
-           GROUP BY c.id ORDER BY plans DESC LIMIT 8"""
-    ))
-
-    top_activities = rows(g.db.execute(
-        """SELECT a.name,a.category,c.name as city,a.cost as avg_cost,
-                  COUNT(pa.id) as adds
-           FROM activities a
-           LEFT JOIN planned_activities pa ON pa.activity_id=a.id
-           JOIN cities c ON c.id=a.city_id
-           GROUP BY a.id ORDER BY adds DESC LIMIT 8"""
-    ))
-
-    engagement = rows(g.db.execute(
-        """SELECT u.id,u.name,u.email,
-                  COUNT(DISTINCT t.id)  as trips_created,
-                  COUNT(DISTINCT s.id)  as stops_added,
-                  COUNT(DISTINCT pa.id) as activities_planned,
-                  COUNT(DISTINCT n.id)  as notes_written
-           FROM users u
-           LEFT JOIN trips t  ON t.user_id=u.id
-           LEFT JOIN stops s  ON s.trip_id=t.id
-           LEFT JOIN planned_activities pa ON pa.stop_id=s.id
-           LEFT JOIN notes n  ON n.trip_id=t.id
-           GROUP BY u.id ORDER BY trips_created DESC LIMIT 10"""
-    ))
-
-    users = rows(g.db.execute(
-        """SELECT u.id,u.name,u.email,u.role,
-                  COUNT(DISTINCT t.id)  as trips_created,
-                  COUNT(DISTINCT pa.id) as activities_planned,
-                  SUM(CASE WHEN t.is_public=1 THEN 1 ELSE 0 END) as public_trips,
-                  COALESCE(SUM(t.budget_limit),0) as planned_budget,
-                  MAX(t.updated_at) as last_trip_date
-           FROM users u
-           LEFT JOIN trips t  ON t.user_id=u.id
-           LEFT JOIN stops s  ON s.trip_id=t.id
-           LEFT JOIN planned_activities pa ON pa.stop_id=s.id
-           GROUP BY u.id ORDER BY u.created_at DESC"""
-    ))
-
-    return ok(
-        counts=counts,
-        tripTrends=trip_trends,
-        tripStatuses=trip_statuses,
-        topCities=top_cities,
-        topActivities=top_activities,
-        engagement=engagement,
-        users=users,
-    )
-
-
-@app.route("/api/admin/users/<int:user_id>", methods=["PUT"])
-
-def admin_update_user(user_id):
-    if g.user.get("role") != "admin":
-        return err("Admin only", 403)
-    b = request.get_json(silent=True) or {}
-    g.db.execute("UPDATE users SET role=? WHERE id=?", (b.get("role","user"), user_id))
-    return ok(message="updated")
-
-
-@app.route("/api/admin/users/<int:user_id>", methods=["DELETE"])
-
-def admin_delete_user(user_id):
-    if g.user.get("role") != "admin":
-        return err("Admin only", 403)
-    if user_id == g.user["id"]:
-        return err("Cannot delete yourself")
-    g.db.execute("DELETE FROM users WHERE id=?", (user_id,))
-    return ok(message="deleted")
-
-
-# ── AUTH (Screens 1, 2, Profile) ──────────────────────────────
-
-@app.route("/api/auth/register", methods=["POST"])
-def register():
-    """Screen 2 – Register new user."""
-    b = request.get_json(silent=True) or {}
-    for f in ("name", "email", "password"):
-        if not b.get(f):
-            return err(f"{f} is required")
-    exists = g.db.execute("SELECT id FROM users WHERE email=?", (b["email"],)).fetchone()
-    if exists:
-        return err("Email already registered")
-    cur = g.db.execute(
-        """INSERT INTO users
-           (first_name,last_name,name,email,password_hash,
-            phone,city,country,bio,photo_url,language,role,created_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        (b.get("first_name",""), b.get("last_name",""),
-         b["name"], b["email"], password_hash(b["password"]),
-         b.get("phone",""), b.get("city",""), b.get("country",""),
-         b.get("bio",""), b.get("photo_url",""),
-         b.get("language","English"), "user", now())
-    )
-    user = one(g.db.execute("SELECT * FROM users WHERE id=?", (cur.lastrowid,)).fetchone())
-    token = secrets.token_urlsafe(32)
-    g.db.execute("INSERT INTO sessions (token,user_id,created_at) VALUES (?,?,?)",
-                 (token, user["id"], now()))
-    user.pop("password_hash", None)
-    return ok(token=token, user=user), 201
-
-
-@app.route("/api/auth/login", methods=["POST"])
-def login():
-    """Screen 1 – Login."""
-    b = request.get_json(silent=True) or {}
-    if not b.get("email") or not b.get("password"):
-        return err("email and password required")
-    user = one(g.db.execute("SELECT * FROM users WHERE email=?", (b["email"],)).fetchone())
-    if not user or not password_ok(b["password"], user["password_hash"]):
-        return err("Invalid email or password", 401)
-    token = secrets.token_urlsafe(32)
-    g.db.execute("INSERT INTO sessions (token,user_id,created_at) VALUES (?,?,?)",
-                 (token, user["id"], now()))
-    user.pop("password_hash", None)
-    return ok(token=token, user=user)
-
-
-@app.route("/api/auth/logout", methods=["POST"])
-
-def logout():
-    token = request.headers.get("X-Token","")
-    g.db.execute("DELETE FROM sessions WHERE token=?", (token,))
-    return ok(message="logged out")
-
-
-@app.route("/api/auth/me")
-
-def get_me():
-    user = dict(g.user)
-    user.pop("password_hash", None)
-    return ok(user=user)
-
-
-@app.route("/api/auth/me", methods=["PUT"])
-
-def update_me():
-    b = request.get_json(silent=True) or {}
-    u = g.user
-    g.db.execute(
-        """UPDATE users SET first_name=?,last_name=?,name=?,phone=?,
-           city=?,country=?,bio=?,photo_url=?,language=? WHERE id=?""",
-        (b.get("first_name", u["first_name"]), b.get("last_name", u["last_name"]),
-         b.get("name", u["name"]), b.get("phone", u["phone"]),
-         b.get("city", u["city"]), b.get("country", u["country"]),
-         b.get("bio", u["bio"]), b.get("photo_url", u["photo_url"]),
-         b.get("language", u["language"]), u["id"])
-    )
-    user = one(g.db.execute("SELECT * FROM users WHERE id=?", (u["id"],)).fetchone())
-    user.pop("password_hash", None)
-    return ok(user=user)
-
-
-@app.route("/api/auth/me", methods=["DELETE"])
-
-def delete_me():
-    g.db.execute("DELETE FROM users WHERE id=?", (g.user["id"],))
-    return ok(message="account deleted")
-
-
-# ── PRIVATE HELPERS ───────────────────────────────────────────
-
-def _load_stops(trip_id: int) -> list[dict]:
-    """Load stops with city info and planned activities nested."""
-    stop_rows = rows(g.db.execute(
-        """SELECT s.*, c.name as city_name, c.country, c.image_url as city_image,
-                  c.cost_index, c.avg_hotel_cost, c.avg_meal_cost
-           FROM stops s JOIN cities c ON c.id=s.city_id
-           WHERE s.trip_id=? ORDER BY s.sort_order""",
-        (trip_id,)
-    ))
-    for stop in stop_rows:
-        stop["activities"] = _load_planned(stop["id"])
-    return stop_rows
-
-
-def _load_stop(stop_id: int) -> dict | None:
-    """Load a single stop with activities."""
-    stop = one(g.db.execute(
-        """SELECT s.*, c.name as city_name, c.country, c.image_url as city_image
-           FROM stops s JOIN cities c ON c.id=s.city_id WHERE s.id=?""",
-        (stop_id,)
-    ).fetchone())
-    if stop:
-        stop["activities"] = _load_planned(stop_id)
-    return stop
-
-
-def _load_planned(stop_id: int) -> list[dict]:
-    """Load planned activities with activity detail joined."""
-    return rows(g.db.execute(
-        """SELECT pa.*, a.name, a.category, a.cost, a.duration_hours,
-                  a.image_url, a.description
-           FROM planned_activities pa
-           JOIN activities a ON a.id=pa.activity_id
-           WHERE pa.stop_id=? ORDER BY pa.activity_date, pa.start_time""",
-        (stop_id,)
-    ))
 # ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
