@@ -240,7 +240,6 @@ def init_db() -> None:
         conn.executescript(SCHEMA)
         seed(conn)
 
-
 def seed(conn: sqlite3.Connection) -> None:
     for city in CITIES:
         conn.execute(
