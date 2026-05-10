@@ -1,4 +1,5 @@
 import { useState, useMemo } from "react";
+import { assetUrl } from "../api.js";
 
 /* ─────────────────────────────────────────────
    HELPERS
@@ -118,7 +119,7 @@ export default function DashboardScreen({
           title={user.name ?? "Profile"}
         >
           {user.photo_url ? (
-            <img src={user.photo_url} alt="avatar" style={styles.avatarImg} />
+            <img src={assetUrl(user.photo_url)} alt="avatar" style={styles.avatarImg} />
           ) : (
             initials
           )}
