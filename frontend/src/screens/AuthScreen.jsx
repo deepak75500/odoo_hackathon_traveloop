@@ -1,21 +1,8 @@
 import { useState, useRef } from "react";
-import { api, saveSession } from "../api.js";
+import { API_ORIGIN, api, assetUrl, saveSession } from "../api.js";
 import { Button, Field, Icons } from "../components/ui.jsx";
 
-// ---------------------------------------------------------------------------
-// API base URL
-// In dev, Vite runs on :5173 but FastAPI on :8082, so relative /uploads/…
-// won't load. Set VITE_API_URL=http://localhost:8082 in your .env file.
-// In production (same origin) leave it unset — it defaults to "".
-// ---------------------------------------------------------------------------
-const API_BASE = import.meta.env.VITE_API_URL ?? "";
-
-/** Turns a server-relative path into a full URL the browser can load. */
-function resolveUrl(path) {
-  if (!path) return "";
-  if (path.startsWith("http")) return path;
-  return `${API_BASE}${path}`;
-}
+const API_BASE = API_ORIGIN;
 
 // ---------------------------------------------------------------------------
 // Country codes
@@ -88,26 +75,6 @@ function Spinner() {
 }
 
 // ---------------------------------------------------------------------------
-// uploadPhoto
-// POST /api/upload/photo  — multipart with two fields:
-//   file    : the image file
-//   old_url : current server path so the backend can delete it (prevents orphans)
-// Returns { url: "/uploads/photos/<uuid>.<ext>" }
-// ---------------------------------------------------------------------------
-async function uploadPhoto(file, oldUrl = "") {
-  const fd = new FormData();
-  fd.append("file", file);
-  if (oldUrl) fd.append("old_url", oldUrl); // backend deletes the old file
-
-  const res = await fetch(`${API_BASE}/api/upload/photo`, { method: "POST", body: fd });
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err.detail || "Photo upload failed.");
-  }
-  return (await res.json()).url; // "/uploads/photos/abc123.jpg"
-}
-
-// ---------------------------------------------------------------------------
 // PhotoPicker
 // value        — current photo_url stored in the parent form (server path)
 // onChange(url)— called with new server URL or "" to clear
@@ -138,8 +105,8 @@ function PhotoPicker({ value, onChange, onError, onUploading }) {
     try {
       // Pass the existing value as old_url — backend deletes the previous file.
       // This prevents orphaned files when the user uploads multiple times.
-      const serverUrl = await uploadPhoto(file, value);
-      onChange(serverUrl);
+      const payload = await api.uploadPhoto(file, value);
+      onChange(payload.url);
     } catch (err) {
       onError(err.message);
       onChange("");
@@ -155,13 +122,13 @@ function PhotoPicker({ value, onChange, onError, onUploading }) {
     if (fileRef.current) fileRef.current.value = "";
   }
 
-  // resolveUrl converts "/uploads/photos/abc.jpg" → full URL using API_BASE
-  const previewSrc = resolveUrl(value);
+  // assetUrl converts "/uploads/photos/abc.jpg" into a URL the browser can load.
+  const previewSrc = assetUrl(value);
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
 
-      {/* Avatar preview — always reads from the server URL via resolveUrl */}
+      {/* Avatar preview — always reads from a browser-loadable image URL */}
       {previewSrc ? (
         <div style={{ position: "relative", width: "80px", height: "80px" }}>
           <img
