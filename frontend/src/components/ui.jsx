@@ -10,6 +10,7 @@ import {
   Map,
   MapPin,
   NotebookText,
+  Pencil,
   Plane,
   Plus,
   Search,
@@ -33,6 +34,7 @@ export const Icons = {
   Map,
   MapPin,
   NotebookText,
+  Pencil,
   Plane,
   Plus,
   Search,
@@ -126,8 +128,16 @@ export function TripSelect({ trips, selectedTripId, onChange }) {
   return (
     <div className="trip-select">
       <CalendarDays size={17} />
-      <select value={selectedTripId || ""} onChange={(event) => onChange(Number(event.target.value))}>
-        <option value="">Select trip</option>
+      <select
+        value={selectedTripId || ""}
+        onChange={(event) => {
+          const value = event.target.value;
+          onChange(value ? Number(value) : null);
+        }}
+      >
+        <option value="" disabled>
+          Select trip
+        </option>
         {trips.map((trip) => (
           <option key={trip.id} value={trip.id}>
             {trip.name}
